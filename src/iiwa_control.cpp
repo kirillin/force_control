@@ -16,6 +16,7 @@
 #include <std_msgs/Float64.h>
 #include <sensor_msgs/JointState.h>
 #include <geometry_msgs/WrenchStamped.h>
+#include <geometry_msgs/Point.h>
 
 // Local
 #include "joint_space_planner.hpp"
@@ -61,6 +62,9 @@ public:
         force_pid.e.resize(6);
         fk_frame = KDL::Frame::Identity();
         Fe.resize(6); Fd.resize(6); Fzd = 0; z_I = 0; z_r;
+        camera_point = Eigen::Vector3d(0, 0, 0);
+        base_point = Eigen::Vector3d(0, 0, 0);
+        z_angle = 0;
 
 
         /// Control
@@ -79,9 +83,9 @@ public:
 
         // Setup Force control
         force_pid.Kp = Eigen::MatrixXd::Identity(6, 6);
-        force_pid.Kp.diagonal() << 100, 100, 100, 20, 20, 20;
+        force_pid.Kp.diagonal() << 500, 500, 500, 10, 10, 10;
         force_pid.Kd = Eigen::MatrixXd::Identity(n, n);
-        force_pid.Kd.diagonal() << 3, 3, 3, 3, 3, 3, 3;
+        force_pid.Kd.diagonal() << 2, 2, 2, 2, 1, 1, 1;
 
         // Setup trapez planner
         trapez_planner.init(n, M_PI_2, M_PI_4, TIME_STEP);
@@ -89,24 +93,21 @@ public:
         // Setup test initial positon (initial positon)
         qd.resize(n);
 		qd[0] = 0;
-		qd[1] = 0.7;
+		qd[1] = 0.72;
 		qd[2] = 0;
-		qd[3] = -1.8;
+		qd[3] = -1.94;
 		qd[4] = 0;
-		qd[5] = 0.5 + 0.1415;
-		qd[6] = 0;
+		qd[5] = 0.48;
+		qd[6] = M_PI_2;
         q_i = qd;
 
-        pd = KDL::Vector(0.5, 0, 0.15);
+        pd = KDL::Vector(0.46, 0, 0.12);
 
         // Desired orientation (y rotation to pi)
-        quatd.w() = cos(M_PI/2);
-        quatd.x() = 0;
-        quatd.y() = sin(M_PI/2);
-        quatd.z() = 0;
+        quatd = Eigen::Quaterniond(cos(-M_PI/4), 0, 0, sin(-M_PI/4))*Eigen::Quaterniond(cos(M_PI/2), 0, sin(M_PI/2), 0);
 
         // Desired Force z
-        Fzd = -20;
+        Fzd = -120;
 
         // Test planner
         Eigen::VectorXd q0 = Eigen::VectorXd::Zero(n);
@@ -127,6 +128,7 @@ public:
         }
         joint_states_sub = nodh.subscribe("/iiwa/joint_states", 10, &iiwa::update_joints_state, this);
         ft_sensor_sub = nodh.subscribe("/iiwa/state/CartesianWrench", 10, &iiwa::update_ft_state, this);
+        camer_point_sub = nodh.subscribe("/iiwa/camera1/line_coordinate", 2, &iiwa::update_desired_point, this);
 
         torque_msg.resize(n);
     }
@@ -141,7 +143,8 @@ public:
             q(i) = msg->position[i];
             q_dot(i) = msg->velocity[i];
         }
-
+        // M ddq + C dq + g = tau
+        // f(q,dq, ddq) = tau
         /// Get Dynamic model matrices (M, C, G)
         // dynamics_kdl.JntToMass(q, M);
         dynamics_kdl.JntToCoriolis(q, q_dot, C);
@@ -157,14 +160,13 @@ public:
             position_pid.e  = qd - q.data;
             position_pid.calcI();
 
-            torque = (position_pid.Kp*position_pid.e + position_pid.Ki*position_pid.I + position_pid.Kd*(qd_dot - q_dot.data) + C.data + G.data);
+            torque = (position_pid.Kp*position_pid.e + position_pid.Ki*position_pid.I + position_pid.Kd*(qd_dot - q_dot.data) + G.data);
             // ROS_INFO_STREAM("e: " << position_pid.e.transpose());
 
             if ((q_i - q.data).norm() < 5e-2) {
                 initial_positon = true;
                 force_control = true;
             }
-
         }
 
         if (force_control) {
@@ -175,16 +177,31 @@ public:
             // ROS_INFO_STREAM(fk_frame.p.x() << ", " << fk_frame.p.y() << ", " << fk_frame.p.z());
             // ROS_INFO_STREAM(quate.x() << ", " << quate.y() << ", " << quate.z() << ", " << quate.w());
 
+            // Rotate point from camera
+            base_point = (quate * camera_point);
+            // ROS_INFO_STREAM(base_point.transpose());
+
             // Jacobian
             jacobian_kdl.JntToJac(q, J);
 
             // Quaternion E matrix
             calculateEmatrixFromQuaternion(E, quate);
 
-            // Hybrid Positon/Force control
-            z_I += 0.00001*(Fzd - Fe[2]);
-            z_r = pd.data[2] + 0.0001*(Fzd - Fe[2]) + z_I;
-            ROS_INFO_STREAM(z_r);
+            // [x y fz roll pitch yaw]
+
+            // Hybrid Posion/Force control (position)
+            z_I += 0.00002*(Fzd - Fe[2]);
+            z_r = pd.data[2];
+            z_r += 0.0002*(Fzd - Fe[2]) + z_I;
+
+            // Orientation
+            z_angle = 0.005*atan2(camera_point[1], -camera_point[0]);
+            // ROS_INFO_STREAM(z_angle);
+            quatd = Eigen::Quaterniond(cos(z_angle/2), 0, 0, sin(z_angle/2))*quatd;
+
+            pd.data[0] += 0.0001*base_point[0];
+            pd.data[1] += 0.0001*base_point[1];
+            // ROS_INFO_STREAM(z_r);
 
             // error
             p_err.data[0] = pd.data[0] - fk_frame.p.data[0];
@@ -200,7 +217,8 @@ public:
             force_pid.e[5] = w_err.z();
             // ROS_INFO_STREAM("e: " << force_pid.e.transpose());
 
-            torque = J.data.transpose()*force_pid.Kp*force_pid.e - force_pid.Kd*q_dot.data + C.data + G.data;
+            // S(q) (PD+) + (I - S(q)) (MDC)
+            torque = (J.data.transpose())*force_pid.Kp*force_pid.e - force_pid.Kd*q_dot.data + G.data;
         }
 
         for (size_t i = 0; i < n; ++i) {
@@ -217,6 +235,14 @@ public:
         Fe[3] = msg->wrench.torque.x;
         Fe[4] = msg->wrench.torque.y;
         Fe[5] = msg->wrench.torque.z;
+    }
+
+    void update_desired_point(const geometry_msgs::Point::ConstPtr & msg)
+    {
+        if (force_control) {
+            camera_point[0] = msg->x;
+            camera_point[1] = msg->y;
+        }
     }
 
 private:
@@ -295,7 +321,12 @@ private:
     Eigen::VectorXd Fd;         // Desired force
     double Fzd;                 // Desired force z
     double z_I;                 // Integral part of z
-    double z_r;                 
+    double z_r;
+    double z_angle;
+
+    // Point from camera and relative base
+    Eigen::Vector3d camera_point;
+    Eigen::Vector3d base_point;
 
     // joint positoions control
     PID position_pid;
@@ -312,6 +343,7 @@ private:
     std::vector<ros::Publisher> torque_control_pub;
     ros::Subscriber joint_states_sub;
     ros::Subscriber ft_sensor_sub;
+    ros::Subscriber camer_point_sub;
 
     std::vector<std_msgs::Float64> torque_msg;
 
